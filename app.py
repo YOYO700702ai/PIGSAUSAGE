@@ -42,12 +42,12 @@ def get_font_path(font_name: str, font_url: str) -> str:
 # ==========================================
 # 2. 核心 API 模組 (API Modules)
 # ==========================================
-def analyze_image_with_gemini(image: Image.Image, api_key: str) -> list:
+def analyze_image_with_gemini(image: Image.Image, api_key: str, model_name: str) -> list:
     """呼叫 Gemini API 進行簡體辨識與座標提取"""
     genai.configure(api_key=api_key)
     
-    # 這裡預設使用支援視覺且穩定的模型，可依最新環境修改為 gemini-3.0-pro 等
-    model = genai.GenerativeModel('gemini-1.5-pro') 
+    # 使用使用者選擇的模型
+    model = genai.GenerativeModel(model_name) 
     
     width, height = image.size
     prompt = f"""
@@ -132,7 +132,6 @@ def draw_text_on_image(bg_image: Image.Image, text_data: list, font_path: str) -
                 # 自動換行邏輯 (以字元為單位)
                 for char in text:
                     test_line = current_line + char
-                    # 取得單行文字的寬高
                     bbox = font.getbbox(test_line)
                     w = bbox[2] - bbox[0]
                     if w <= box_w:
@@ -184,15 +183,18 @@ def main():
     if "bg_image_bytes" not in st.session_state:
         st.session_state.bg_image_bytes = None
         
-    # 重置狀態的輔助函式 (當上傳新圖片時觸發)
     def reset_state():
         st.session_state.step = 0
         st.session_state.gemini_data = []
         st.session_state.bg_image_bytes = None
 
-    # --- 側邊欄：API 金鑰設定 ---
+    # --- 側邊欄：API 金鑰與設定 ---
     st.sidebar.header("🔑 API 設定")
     gemini_key = st.sidebar.text_input("Gemini API Key", type="password", help="用於步驟1：文字辨識與翻譯")
+    
+    # 直接固定使用 gemini-3.0-pro-latest 模型
+    gemini_model = "gemini-3.0-pro-latest"
+    
     clipdrop_key = st.sidebar.text_input("Clipdrop API Key", type="password", help="用於步驟2：無痕移除背景文字")
     
     st.sidebar.divider()
@@ -227,19 +229,20 @@ def main():
     col1, col2 = st.columns([1, 4])
     with col1:
         if st.button("🔍 執行 AI 辨識", type="primary"):
-            with st.spinner("Gemini 正在努力解析文字與座標..."):
+            with st.spinner(f"Gemini ({gemini_model}) 正在解析文字與座標..."):
                 try:
-                    data = analyze_image_with_gemini(image, gemini_key)
+                    # 傳入選擇的模型名稱
+                    data = analyze_image_with_gemini(image, gemini_key, gemini_model)
                     st.session_state.gemini_data = data
                     st.session_state.step = 1
                     st.success("辨識完成！請在右側表格校對資料。")
                 except Exception as e:
-                    st.error(f"Gemini 辨識發生錯誤：{str(e)}")
+                    st.error(f"Gemini 辨識發生錯誤：\n{str(e)}")
+                    st.info("💡 提示：如果看到 '404 models/xxx is not found'，請在左側欄切換另一個 Gemini 模型再試一次。")
                     
     with col2:
         if st.session_state.step >= 1:
             st.markdown("👇 **您可以在下方表格直接修改繁體文字、邊界框 (ymin, xmin, ymax, xmax) 或色碼：**")
-            # 確保資料格式正確並轉換為可編輯的 DataFrame
             edited_data = st.data_editor(
                 st.session_state.gemini_data, 
                 num_rows="dynamic",
@@ -269,7 +272,6 @@ def main():
     if st.button("🧹 呼叫 Clipdrop 清除底圖文字", type="primary"):
         with st.spinner("Clipdrop 正在進行背景修補... (這可能需要幾秒鐘)"):
             try:
-                # 將 PIL Image 轉換為 bytes
                 img_byte_arr = io.BytesIO()
                 image.save(img_byte_arr, format='PNG')
                 image_bytes = img_byte_arr.getvalue()
@@ -308,7 +310,6 @@ def main():
             if font_path:
                 bg_image = Image.open(io.BytesIO(st.session_state.bg_image_bytes)).convert("RGB")
                 
-                # 執行文字繪製
                 final_image = draw_text_on_image(
                     bg_image=bg_image, 
                     text_data=st.session_state.gemini_data, 
@@ -318,7 +319,6 @@ def main():
                 st.success("🎉 合成完成！")
                 st.image(final_image, caption="最終線索卡", use_container_width=True)
                 
-                # 提供下載按鈕
                 buf = io.BytesIO()
                 final_image.save(buf, format="PNG")
                 byte_im = buf.getvalue()
