@@ -174,7 +174,7 @@ def main():
 
     st.sidebar.header("🔑 API 設定")
     gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
-    gemini_model = "gemini-1.5-pro-latest"
+    gemini_model = "gemini-1.5-pro"
     clipdrop_key = st.sidebar.text_input("Clipdrop API Key", type="password")
     
     st.sidebar.divider()
