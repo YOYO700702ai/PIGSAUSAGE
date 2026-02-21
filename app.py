@@ -192,8 +192,8 @@ def main():
     st.sidebar.header("🔑 API 設定")
     gemini_key = st.sidebar.text_input("Gemini API Key", type="password", help="用於步驟1：文字辨識與翻譯")
     
-    # 直接固定使用 gemini-3.0-pro-latest 模型
-    gemini_model = "gemini-3.0-pro-latest"
+    # 直接固定使用 gemini-1.5-pro-latest 模型
+    gemini_model = "gemini-1.5-pro-latest"
     
     clipdrop_key = st.sidebar.text_input("Clipdrop API Key", type="password", help="用於步驟2：無痕移除背景文字")
     
