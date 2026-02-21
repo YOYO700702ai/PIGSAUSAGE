@@ -1,0 +1,334 @@
+import streamlit as st
+import google.generativeai as genai
+import requests
+from PIL import Image, ImageDraw, ImageFont
+import json
+import io
+import os
+import urllib.request
+import re
+
+# ==========================================
+# 1. 系統設定與快取函式 (Configuration & Cache)
+# ==========================================
+st.set_page_config(page_title="簡轉繁線索卡自動轉換器", layout="wide", page_icon="🎴")
+
+# 定義可選字體與其下載連結 (使用開源 Noto 系列字體)
+FONT_OPTIONS = {
+    "思源黑體 (Noto Sans TC)": "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf",
+    "思源宋體 (Noto Serif TC)": "https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/TraditionalChinese/NotoSerifCJKtc-Regular.otf"
+}
+
+@st.cache_resource(show_spinner="正在下載/載入字體庫...")
+def get_font_path(font_name: str, font_url: str) -> str:
+    """下載並暫存字體檔案，避免每次重新整理都重新下載"""
+    font_dir = "./fonts"
+    if not os.path.exists(font_dir):
+        os.makedirs(font_dir)
+        
+    # 根據 URL 取得副檔名
+    ext = font_url.split(".")[-1]
+    safe_name = font_name.split(" ")[0]
+    font_path = os.path.join(font_dir, f"{safe_name}.{ext}")
+    
+    if not os.path.exists(font_path):
+        try:
+            urllib.request.urlretrieve(font_url, font_path)
+        except Exception as e:
+            st.error(f"字體下載失敗: {e}")
+            return ""
+    return font_path
+
+# ==========================================
+# 2. 核心 API 模組 (API Modules)
+# ==========================================
+def analyze_image_with_gemini(image: Image.Image, api_key: str) -> list:
+    """呼叫 Gemini API 進行簡體辨識與座標提取"""
+    genai.configure(api_key=api_key)
+    
+    # 這裡預設使用支援視覺且穩定的模型，可依最新環境修改為 gemini-3.0-pro 等
+    model = genai.GenerativeModel('gemini-1.5-pro') 
+    
+    width, height = image.size
+    prompt = f"""
+    你是一個專業的繁體中文在地化與排版專家。
+    請分析這張圖片（尺寸：寬 {width}px, 高 {height}px），找出所有「簡體中文」文字。
+    將這些文字翻譯成「繁體中文」。
+    請為每段文字估算它在圖片中的邊界框 (Bounding Box) 以及主要的文字顏色。
+
+    嚴格依照以下 JSON 格式回傳，不要包含任何 markdown 語法 (如 ```json) 或其他說明文字，只需回傳 JSON 陣列本身：
+    [
+      {{
+        "text": "繁體翻譯後的文字",
+        "box": [ymin, xmin, ymax, xmax],
+        "hex_color": "#FFFFFF"
+      }}
+    ]
+    請注意：
+    1. box 的數值必須是整數像素 (pixels)，對應原圖尺寸 (寬 {width}, 高 {height})。
+    2. 順序為 ymin(上邊界), xmin(左邊界), ymax(下邊界), xmax(右邊界)。
+    3. hex_color: 必須是 6 碼或 3 碼的有效 HEX 顏色碼。
+    """
+    
+    response = model.generate_content([prompt, image])
+    text_res = response.text.strip()
+    
+    # 清理可能附帶的 markdown 標籤
+    text_res = re.sub(r'^```json', '', text_res)
+    text_res = re.sub(r'^```', '', text_res)
+    text_res = re.sub(r'```$', '', text_res).strip()
+    
+    try:
+        data = json.loads(text_res)
+        return data
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Gemini 回傳的格式非有效 JSON。原始回傳內容：\n{text_res}") from e
+
+def remove_text_with_clipdrop(image_bytes: bytes, api_key: str) -> bytes:
+    """呼叫 Clipdrop API 進行文字擦除"""
+    url = "https://clipdrop-api.co/remove-text/v1"
+    headers = {"x-api-key": api_key}
+    files = {"image_file": ("image.png", image_bytes, "image/png")}
+    
+    response = requests.post(url, headers=headers, files=files)
+    
+    if response.status_code == 200:
+        return response.content
+    else:
+        error_msg = response.json().get('error', response.text)
+        raise Exception(f"Clipdrop API 錯誤 (狀態碼 {response.status_code}): {error_msg}")
+
+# ==========================================
+# 3. 圖像處理模組 (Image Processing)
+# ==========================================
+def draw_text_on_image(bg_image: Image.Image, text_data: list, font_path: str) -> Image.Image:
+    """根據座標與顏色，在無字底圖上重新繪製繁體中文文字"""
+    result_img = bg_image.copy()
+    draw = ImageDraw.Draw(result_img)
+    
+    for item in text_data:
+        try:
+            text = item.get("text", "")
+            box = item.get("box", [0, 0, 0, 0])
+            color = item.get("hex_color", "#FFFFFF")
+            
+            ymin, xmin, ymax, xmax = box
+            box_w = xmax - xmin
+            box_h = ymax - ymin
+            
+            if box_w <= 0 or box_h <= 0 or not text:
+                continue
+                
+            # 自動計算合適的字體大小 (自適應演算法)
+            font_size = box_h  # 初始假設單行填滿高度
+            font = ImageFont.truetype(font_path, int(font_size))
+            
+            lines = []
+            while font_size > 8:
+                font = ImageFont.truetype(font_path, int(font_size))
+                lines = []
+                current_line = ""
+                
+                # 自動換行邏輯 (以字元為單位)
+                for char in text:
+                    test_line = current_line + char
+                    # 取得單行文字的寬高
+                    bbox = font.getbbox(test_line)
+                    w = bbox[2] - bbox[0]
+                    if w <= box_w:
+                        current_line = test_line
+                    else:
+                        if current_line: lines.append(current_line)
+                        current_line = char
+                if current_line:
+                    lines.append(current_line)
+                    
+                # 計算總高度 (含行距)
+                line_spacing = int(font_size * 0.2)
+                total_h = sum([font.getbbox(l)[3] - font.getbbox(l)[1] for l in lines])
+                total_h += line_spacing * (len(lines) - 1)
+                
+                # 如果高度符合 Bounding Box，則跳出迴圈
+                if total_h <= box_h:
+                    break
+                    
+                font_size -= 2 # 逐步縮小字體
+                
+            # 實際繪製文字 (具備 Pillow 預設之抗鋸齒效果)
+            y_text = ymin
+            for line in lines:
+                bbox = font.getbbox(line)
+                h = bbox[3] - bbox[1]
+                draw.text((xmin, y_text), line, font=font, fill=color)
+                y_text += h + int(font_size * 0.2)
+                
+        except Exception as e:
+            st.warning(f"繪製文字區塊時發生錯誤，區塊內容: {item.get('text')}, 錯誤: {e}")
+            
+    return result_img
+
+# ==========================================
+# 4. 主程式 UI 流程 (Streamlit App Flow)
+# ==========================================
+def main():
+    st.title("🎴 簡轉繁線索卡自動轉換器")
+    st.markdown("結合 **Google Gemini** 與 **Clipdrop** 進行文字辨識、智慧擦除與無縫繁體合成。")
+    
+    # --- 狀態管理 (Session State) ---
+    if "step" not in st.session_state:
+        st.session_state.step = 0
+    if "original_image" not in st.session_state:
+        st.session_state.original_image = None
+    if "gemini_data" not in st.session_state:
+        st.session_state.gemini_data = []
+    if "bg_image_bytes" not in st.session_state:
+        st.session_state.bg_image_bytes = None
+        
+    # 重置狀態的輔助函式 (當上傳新圖片時觸發)
+    def reset_state():
+        st.session_state.step = 0
+        st.session_state.gemini_data = []
+        st.session_state.bg_image_bytes = None
+
+    # --- 側邊欄：API 金鑰設定 ---
+    st.sidebar.header("🔑 API 設定")
+    gemini_key = st.sidebar.text_input("Gemini API Key", type="password", help="用於步驟1：文字辨識與翻譯")
+    clipdrop_key = st.sidebar.text_input("Clipdrop API Key", type="password", help="用於步驟2：無痕移除背景文字")
+    
+    st.sidebar.divider()
+    st.sidebar.info("使用說明：\n1. 上傳原圖\n2. AI 辨識與校對文字座標\n3. 生成無字底圖\n4. 選擇字體並合成最終圖片")
+
+    # --- 主畫面：圖片上傳 ---
+    uploaded_file = st.file_uploader("上傳欲轉換的原始線索卡 (支援 JPG, PNG)", type=["jpg", "jpeg", "png"], on_change=reset_state)
+    
+    if not uploaded_file:
+        st.info("請先上傳一張圖片以開始流程。")
+        return
+
+    # 讀取並顯示原圖
+    image = Image.open(uploaded_file).convert("RGB")
+    st.session_state.original_image = image
+    
+    with st.expander("預覽原始圖片", expanded=False):
+        st.image(image, caption="原始上傳圖片", use_container_width=True)
+
+    # 檢查 API 金鑰
+    if not gemini_key or not clipdrop_key:
+        st.warning("⚠️ 請先於左側邊欄填寫 Gemini 與 Clipdrop API Key。")
+        return
+
+    st.divider()
+
+    # ==========================================
+    # 步驟 1：AI 大腦辨識與人工校對 (Gemini)
+    # ==========================================
+    st.header("步驟 1：AI 大腦辨識與人工校對")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🔍 執行 AI 辨識", type="primary"):
+            with st.spinner("Gemini 正在努力解析文字與座標..."):
+                try:
+                    data = analyze_image_with_gemini(image, gemini_key)
+                    st.session_state.gemini_data = data
+                    st.session_state.step = 1
+                    st.success("辨識完成！請在右側表格校對資料。")
+                except Exception as e:
+                    st.error(f"Gemini 辨識發生錯誤：{str(e)}")
+                    
+    with col2:
+        if st.session_state.step >= 1:
+            st.markdown("👇 **您可以在下方表格直接修改繁體文字、邊界框 (ymin, xmin, ymax, xmax) 或色碼：**")
+            # 確保資料格式正確並轉換為可編輯的 DataFrame
+            edited_data = st.data_editor(
+                st.session_state.gemini_data, 
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "text": st.column_config.TextColumn("繁體翻譯", required=True),
+                    "box": st.column_config.ListColumn("邊界框座標 [ymin, xmin, ymax, xmax]"),
+                    "hex_color": st.column_config.TextColumn("HEX 顏色碼", required=True)
+                }
+            )
+            
+            if st.button("✅ 確認文字與座標無誤，進行下一步"):
+                st.session_state.gemini_data = edited_data
+                st.session_state.step = 2
+                st.rerun()
+
+    if st.session_state.step < 2:
+        return
+        
+    st.divider()
+
+    # ==========================================
+    # 步驟 2：全自動背景修補與預覽 (Clipdrop)
+    # ==========================================
+    st.header("步驟 2：全自動背景修補與預覽")
+    
+    if st.button("🧹 呼叫 Clipdrop 清除底圖文字", type="primary"):
+        with st.spinner("Clipdrop 正在進行背景修補... (這可能需要幾秒鐘)"):
+            try:
+                # 將 PIL Image 轉換為 bytes
+                img_byte_arr = io.BytesIO()
+                image.save(img_byte_arr, format='PNG')
+                image_bytes = img_byte_arr.getvalue()
+                
+                bg_bytes = remove_text_with_clipdrop(image_bytes, clipdrop_key)
+                st.session_state.bg_image_bytes = bg_bytes
+                st.success("底圖修補成功！")
+            except Exception as e:
+                st.error(f"Clipdrop 修補發生錯誤：{str(e)}")
+
+    if st.session_state.bg_image_bytes:
+        bg_image = Image.open(io.BytesIO(st.session_state.bg_image_bytes)).convert("RGB")
+        st.image(bg_image, caption="無字底圖預覽", use_container_width=True)
+        
+        if st.button("✅ 底圖修補完美，進行最後合成"):
+            st.session_state.step = 3
+            st.rerun()
+
+    if st.session_state.step < 3:
+        return
+
+    st.divider()
+
+    # ==========================================
+    # 步驟 3：自選字體與精準合成 (Pillow)
+    # ==========================================
+    st.header("步驟 3：自選字體與精準合成")
+    
+    font_choice = st.selectbox("請選擇合成字體", list(FONT_OPTIONS.keys()))
+    font_url = FONT_OPTIONS[font_choice]
+    
+    if st.button("🎨 生成最終圖片", type="primary"):
+        with st.spinner("正在下載字體並合成最終圖片..."):
+            font_path = get_font_path(font_choice, font_url)
+            
+            if font_path:
+                bg_image = Image.open(io.BytesIO(st.session_state.bg_image_bytes)).convert("RGB")
+                
+                # 執行文字繪製
+                final_image = draw_text_on_image(
+                    bg_image=bg_image, 
+                    text_data=st.session_state.gemini_data, 
+                    font_path=font_path
+                )
+                
+                st.success("🎉 合成完成！")
+                st.image(final_image, caption="最終線索卡", use_container_width=True)
+                
+                # 提供下載按鈕
+                buf = io.BytesIO()
+                final_image.save(buf, format="PNG")
+                byte_im = buf.getvalue()
+                
+                st.download_button(
+                    label="📥 下載最終圖片",
+                    data=byte_im,
+                    file_name="translated_clue_card.png",
+                    mime="image/png",
+                )
+
+if __name__ == "__main__":
+    main()
