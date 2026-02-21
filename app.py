@@ -6,27 +6,23 @@ import json
 import io
 import os
 import urllib.request
-import re
 
 # ==========================================
 # 1. 系統設定與快取函式 (Configuration & Cache)
 # ==========================================
 st.set_page_config(page_title="簡轉繁線索卡自動轉換器", layout="wide", page_icon="🎴")
 
-# 定義可選字體與其下載連結 (使用開源 Noto 系列字體)
 FONT_OPTIONS = {
-    "思源黑體 (Noto Sans TC)": "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf",
-    "思源宋體 (Noto Serif TC)": "https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/TraditionalChinese/NotoSerifCJKtc-Regular.otf"
+    "思源黑體 (Noto Sans TC)": "[https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf](https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf)",
+    "思源宋體 (Noto Serif TC)": "[https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/TraditionalChinese/NotoSerifCJKtc-Regular.otf](https://github.com/notofonts/noto-cjk/raw/main/Serif/OTF/TraditionalChinese/NotoSerifCJKtc-Regular.otf)"
 }
 
 @st.cache_resource(show_spinner="正在下載/載入字體庫...")
 def get_font_path(font_name: str, font_url: str) -> str:
-    """下載並暫存字體檔案，避免每次重新整理都重新下載"""
     font_dir = "./fonts"
     if not os.path.exists(font_dir):
         os.makedirs(font_dir)
         
-    # 根據 URL 取得副檔名
     ext = font_url.split(".")[-1]
     safe_name = font_name.split(" ")[0]
     font_path = os.path.join(font_dir, f"{safe_name}.{ext}")
@@ -45,8 +41,6 @@ def get_font_path(font_name: str, font_url: str) -> str:
 def analyze_image_with_gemini(image: Image.Image, api_key: str, model_name: str) -> list:
     """呼叫 Gemini API 進行簡體辨識與座標提取"""
     genai.configure(api_key=api_key)
-    
-    # 使用使用者選擇的模型
     model = genai.GenerativeModel(model_name) 
     
     width, height = image.size
@@ -56,7 +50,7 @@ def analyze_image_with_gemini(image: Image.Image, api_key: str, model_name: str)
     將這些文字翻譯成「繁體中文」。
     請為每段文字估算它在圖片中的邊界框 (Bounding Box) 以及主要的文字顏色。
 
-    嚴格依照以下 JSON 格式回傳，不要包含任何 markdown 語法 (如 ```json) 或其他說明文字，只需回傳 JSON 陣列本身：
+    必須回傳 JSON 陣列格式，格式如下：
     [
       {{
         "text": "繁體翻譯後的文字",
@@ -64,29 +58,26 @@ def analyze_image_with_gemini(image: Image.Image, api_key: str, model_name: str)
         "hex_color": "#FFFFFF"
       }}
     ]
-    請注意：
-    1. box 的數值必須是整數像素 (pixels)，對應原圖尺寸 (寬 {width}, 高 {height})。
-    2. 順序為 ymin(上邊界), xmin(左邊界), ymax(下邊界), xmax(右邊界)。
-    3. hex_color: 必須是 6 碼或 3 碼的有效 HEX 顏色碼。
     """
     
-    response = model.generate_content([prompt, image])
-    text_res = response.text.strip()
-    
-    # 清理可能附帶的 markdown 標籤
-    text_res = re.sub(r'^```json', '', text_res)
-    text_res = re.sub(r'^```', '', text_res)
-    text_res = re.sub(r'```$', '', text_res).strip()
+    # 修正重點：強制使用 JSON 模式，避免 Markdown 解析錯誤
+    response = model.generate_content(
+        [prompt, image],
+        generation_config=genai.GenerationConfig(
+            response_mime_type="application/json"
+        )
+    )
     
     try:
-        data = json.loads(text_res)
+        data = json.loads(response.text)
         return data
     except json.JSONDecodeError as e:
-        raise ValueError(f"Gemini 回傳的格式非有效 JSON。原始回傳內容：\n{text_res}") from e
+        raise ValueError(f"Gemini 回傳的格式非有效 JSON。原始回傳內容：\n{response.text}") from e
 
 def remove_text_with_clipdrop(image_bytes: bytes, api_key: str) -> bytes:
     """呼叫 Clipdrop API 進行文字擦除"""
-    url = "https://clipdrop-api.co/remove-text/v1"
+    # 修正重點：正確的 Clipdrop Text Remover API 網址
+    url = "[https://clipdrop-api.co/text-remover/v1](https://clipdrop-api.co/text-remover/v1)"
     headers = {"x-api-key": api_key}
     files = {"image_file": ("image.png", image_bytes, "image/png")}
     
@@ -102,7 +93,6 @@ def remove_text_with_clipdrop(image_bytes: bytes, api_key: str) -> bytes:
 # 3. 圖像處理模組 (Image Processing)
 # ==========================================
 def draw_text_on_image(bg_image: Image.Image, text_data: list, font_path: str) -> Image.Image:
-    """根據座標與顏色，在無字底圖上重新繪製繁體中文文字"""
     result_img = bg_image.copy()
     draw = ImageDraw.Draw(result_img)
     
@@ -119,8 +109,7 @@ def draw_text_on_image(bg_image: Image.Image, text_data: list, font_path: str) -
             if box_w <= 0 or box_h <= 0 or not text:
                 continue
                 
-            # 自動計算合適的字體大小 (自適應演算法)
-            font_size = box_h  # 初始假設單行填滿高度
+            font_size = box_h  
             font = ImageFont.truetype(font_path, int(font_size))
             
             lines = []
@@ -129,7 +118,6 @@ def draw_text_on_image(bg_image: Image.Image, text_data: list, font_path: str) -
                 lines = []
                 current_line = ""
                 
-                # 自動換行邏輯 (以字元為單位)
                 for char in text:
                     test_line = current_line + char
                     bbox = font.getbbox(test_line)
@@ -142,18 +130,15 @@ def draw_text_on_image(bg_image: Image.Image, text_data: list, font_path: str) -
                 if current_line:
                     lines.append(current_line)
                     
-                # 計算總高度 (含行距)
                 line_spacing = int(font_size * 0.2)
                 total_h = sum([font.getbbox(l)[3] - font.getbbox(l)[1] for l in lines])
                 total_h += line_spacing * (len(lines) - 1)
                 
-                # 如果高度符合 Bounding Box，則跳出迴圈
                 if total_h <= box_h:
                     break
                     
-                font_size -= 2 # 逐步縮小字體
+                font_size -= 2 
                 
-            # 實際繪製文字 (具備 Pillow 預設之抗鋸齒效果)
             y_text = ymin
             for line in lines:
                 bbox = font.getbbox(line)
@@ -173,7 +158,6 @@ def main():
     st.title("🎴 簡轉繁線索卡自動轉換器")
     st.markdown("結合 **Google Gemini** 與 **Clipdrop** 進行文字辨識、智慧擦除與無縫繁體合成。")
     
-    # --- 狀態管理 (Session State) ---
     if "step" not in st.session_state:
         st.session_state.step = 0
     if "original_image" not in st.session_state:
@@ -188,42 +172,32 @@ def main():
         st.session_state.gemini_data = []
         st.session_state.bg_image_bytes = None
 
-    # --- 側邊欄：API 金鑰與設定 ---
     st.sidebar.header("🔑 API 設定")
-    gemini_key = st.sidebar.text_input("Gemini API Key", type="password", help="用於步驟1：文字辨識與翻譯")
-    
-    # 直接固定使用 gemini-1.5-pro-latest 模型
+    gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
     gemini_model = "gemini-1.5-pro-latest"
-    
-    clipdrop_key = st.sidebar.text_input("Clipdrop API Key", type="password", help="用於步驟2：無痕移除背景文字")
+    clipdrop_key = st.sidebar.text_input("Clipdrop API Key", type="password")
     
     st.sidebar.divider()
     st.sidebar.info("使用說明：\n1. 上傳原圖\n2. AI 辨識與校對文字座標\n3. 生成無字底圖\n4. 選擇字體並合成最終圖片")
 
-    # --- 主畫面：圖片上傳 ---
     uploaded_file = st.file_uploader("上傳欲轉換的原始線索卡 (支援 JPG, PNG)", type=["jpg", "jpeg", "png"], on_change=reset_state)
     
     if not uploaded_file:
         st.info("請先上傳一張圖片以開始流程。")
         return
 
-    # 讀取並顯示原圖
     image = Image.open(uploaded_file).convert("RGB")
     st.session_state.original_image = image
     
     with st.expander("預覽原始圖片", expanded=False):
         st.image(image, caption="原始上傳圖片", use_container_width=True)
 
-    # 檢查 API 金鑰
     if not gemini_key or not clipdrop_key:
         st.warning("⚠️ 請先於左側邊欄填寫 Gemini 與 Clipdrop API Key。")
         return
 
     st.divider()
 
-    # ==========================================
-    # 步驟 1：AI 大腦辨識與人工校對 (Gemini)
-    # ==========================================
     st.header("步驟 1：AI 大腦辨識與人工校對")
     
     col1, col2 = st.columns([1, 4])
@@ -231,14 +205,13 @@ def main():
         if st.button("🔍 執行 AI 辨識", type="primary"):
             with st.spinner(f"Gemini ({gemini_model}) 正在解析文字與座標..."):
                 try:
-                    # 傳入選擇的模型名稱
                     data = analyze_image_with_gemini(image, gemini_key, gemini_model)
                     st.session_state.gemini_data = data
                     st.session_state.step = 1
                     st.success("辨識完成！請在右側表格校對資料。")
                 except Exception as e:
                     st.error(f"Gemini 辨識發生錯誤：\n{str(e)}")
-                    st.info("💡 提示：如果看到 '404 models/xxx is not found'，請在左側欄切換另一個 Gemini 模型再試一次。")
+                    st.info("💡 提示：如果看到 '404 models/xxx is not found'，請更換 Gemini 模型再試一次。")
                     
     with col2:
         if st.session_state.step >= 1:
@@ -264,9 +237,6 @@ def main():
         
     st.divider()
 
-    # ==========================================
-    # 步驟 2：全自動背景修補與預覽 (Clipdrop)
-    # ==========================================
     st.header("步驟 2：全自動背景修補與預覽")
     
     if st.button("🧹 呼叫 Clipdrop 清除底圖文字", type="primary"):
@@ -295,9 +265,6 @@ def main():
 
     st.divider()
 
-    # ==========================================
-    # 步驟 3：自選字體與精準合成 (Pillow)
-    # ==========================================
     st.header("步驟 3：自選字體與精準合成")
     
     font_choice = st.selectbox("請選擇合成字體", list(FONT_OPTIONS.keys()))
